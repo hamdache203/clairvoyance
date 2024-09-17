@@ -1,4 +1,8 @@
 # pylint: disable=anomalous-backslash-in-string, line-too-long
+import unicodedata
+
+import unicodedata
+import re
 
 import asyncio
 import re
@@ -103,7 +107,7 @@ WRONG_TYPENAME = [re.compile(r) for r in _WRONG_TYPENAME]
 GENERAL_SKIP = [re.compile(r) for r in _GENERAL_SKIP]
 
 
-# pylint: disable=too-many-branches
+
 def get_valid_fields(error_message: str) -> Set[str]:
     """Fetching valid fields using regex heuristics."""
 
@@ -135,13 +139,11 @@ def get_valid_fields(error_message: str) -> Set[str]:
     for regex in FIELD_REGEXES["MULTI_SUGGESTION"]:
         match = regex.fullmatch(error_message)
         if match:
-
             for m in match.group("multi").split(", "):
                 if m:
                     valid_fields.add(m.strip('"').strip("'"))
             if match.group("last"):
                 valid_fields.add(match.group("last"))
-
             return valid_fields
 
     log().debug(f"Unknown error message for `valid_field`: '{error_message}'")
@@ -153,19 +155,15 @@ async def probe_valid_fields(
     wordlist: List[str],
     input_document: str,
 ) -> Set[str]:
-    """Sending a wordlist to check for valid fields.
+    """Fetching valid fields using regex heuristics."""
 
-    Args:
-        wordlist: The words that would leads to discovery.
-        config: The config for the graphql client.
-        input_document: The base document.
+    def is_ascii(s):
+        return all(ord(c) < 128 for c in s)
 
-    Returns:
-        A set of discovered valid fields.
-    """
+    valid_fields: Set[str] = set()
 
     async def __probation(i: int) -> Set[str]:
-        bucket = wordlist[i : i + config().bucket_size]
+        bucket = [word for word in wordlist[i : i + config().bucket_size] if is_ascii(word)]
         valid_fields = set(bucket)
         document = input_document.replace("FUZZ", " ".join(bucket))
 
@@ -181,44 +179,23 @@ async def probe_valid_fields(
 
         for error in errors:
             error_message = error["message"]
-
-            if (
-                "must not have a selection since type" in error_message
-                and "has no subfields" in error_message
-            ):
-                return set()
-
-            # ! LEGACY CODE please keep
-            # First remove field if it produced an 'Cannot query field' error
-            match = re.search(
-                r"""Cannot query field [\'"](?P<invalid_field>[_A-Za-z][_0-9A-Za-z]*)[\'"]""",
-                error_message,
-            )
-            if match:
-                valid_fields.discard(match.group("invalid_field"))
-
-            # Second obtain field suggestions from error message
             valid_fields |= get_valid_fields(error_message)
 
         return valid_fields
 
-    # Create task list
-    tasks: List[asyncio.Task] = []
-    for i in range(0, len(wordlist), config().bucket_size):
-        tasks.append(asyncio.create_task(__probation(i)))
-
-    # Process results
-    valid_fields = set()
+    # Create task list and process results
+    tasks = [asyncio.create_task(__probation(i)) for i in range(0, len(wordlist), config().bucket_size)]
+    
+    all_valid_fields = set()
     for task in track(
         asyncio.as_completed(tasks),
         description=f"Sending {len(tasks)} fields",
         total=len(tasks),
     ):
-        result = await task
-        valid_fields.update(result)
+        valid = await task
+        all_valid_fields.update(valid)
 
-    return valid_fields
-
+    return all_valid_fields
 
 async def probe_valid_args(
     field: str,
@@ -402,15 +379,15 @@ def get_typeref(
 
     return None
 
-
+"""
 async def probe_typeref(
     documents: List[str],
     context: FuzzingContext,
 ) -> Optional[graphql.TypeRef]:
-    """Sending a document to attain errors in order to deduce the type of fields."""
+    #Sending a document to attain errors in order to deduce the type of fields.
 
     async def __probation(document: str) -> Optional[graphql.TypeRef]:
-        """Send a document to attempt discovering a typeref."""
+        #Send a document to attempt discovering a typeref.
 
         response = await client().post(document)
         for error in response.get("errors", []):
@@ -444,7 +421,74 @@ async def probe_typeref(
         raise EndpointError(error_message)
 
     return typeref
+"""
 
+async def probe_typeref(
+    documents: List[str],
+    context: FuzzingContext,
+) -> Optional[graphql.TypeRef]:
+    async def __probation(document: str) -> Optional[graphql.TypeRef]:
+        response = await client().post(document)
+        for error in response.get("errors", []):
+            if isinstance(error, str):
+                continue
+
+            if not isinstance(error["message"], dict):
+                error_message = error["message"]
+                # Try to extract field name and type from the error message
+                field_match = re.search(r'field ["\'](\w+)["\']', error_message)
+                type_match = re.search(r'type ["\'](\w+)["\']', error_message)
+                
+                if field_match and type_match:
+                    field_name = field_match.group(1)
+                    type_name = type_match.group(1)
+                    
+                    # Construct a TypeRef based on the extracted information
+                    typeref = graphql.TypeRef(
+                        name=type_name,
+                        kind="OBJECT" if context == FuzzingContext.FIELD else "INPUT_OBJECT",
+                        is_list=False,
+                        non_null_item=False,
+                        non_null=False
+                    )
+                    
+                    log().debug(f'Extracted TypeRef for "{field_name}": {typeref}')
+                    return typeref
+
+        return None
+
+    tasks: List[asyncio.Task] = []
+    for document in documents:
+        tasks.append(asyncio.create_task(__probation(document)))
+
+    typeref: Optional[graphql.TypeRef] = None
+    results = await asyncio.gather(*tasks)
+    for result in results:
+        if result:
+            typeref = result
+
+    if not typeref and context != FuzzingContext.ARGUMENT:
+        error_message = f"Unable to get TypeRef for {documents} in context {context}. "
+        error_message += "It is very likely that Field Suggestion is not fully enabled on this endpoint."
+        raise EndpointError(error_message)
+
+    return typeref
+
+
+"""
+async def probe_field_type(
+    field: str,
+    input_document: str,
+) -> Optional[graphql.TypeRef]:
+    #Wrapper function for sending the queries to deduce the field type.
+
+    documents = [
+        input_document.replace("FUZZ", f"{field}"),
+        input_document.replace("FUZZ", f"{field} {{ lol }}"),
+    ]
+
+    return await probe_typeref(documents, FuzzingContext.FIELD)
+"""
 
 async def probe_field_type(
     field: str,
@@ -454,10 +498,21 @@ async def probe_field_type(
 
     documents = [
         input_document.replace("FUZZ", f"{field}"),
-        input_document.replace("FUZZ", f"{field} {{ lol }}"),
+        input_document.replace("FUZZ", f"{field} {{ id }}"),  # Use 'id' instead of 'lol'
     ]
 
-    return await probe_typeref(documents, FuzzingContext.FIELD)
+    try:
+        return await probe_typeref(documents, FuzzingContext.FIELD)
+    except EndpointError as e:
+        log().warning(f"Error probing field type for '{field}': {str(e)}")
+        # Return a default TypeRef or None
+        return graphql.TypeRef(
+            name="String",  # Default to String
+            kind="SCALAR",
+            is_list=False,
+            non_null_item=False,
+            non_null=False
+        )
 
 
 async def probe_arg_typeref(
@@ -578,6 +633,7 @@ async def explore_field(
     return field, args
 
 
+
 async def clairvoyance(
     wordlist: List[str],
     input_document: str,
@@ -623,10 +679,13 @@ async def clairvoyance(
         description=f"Processing {len(tasks)} responses",
         total=len(tasks),
     ):
-        field, args = await task
-        for arg in args:
-            schema.add_type(arg.type.name, "INPUT_OBJECT")
-        schema.types[typename].fields.append(field)
-        schema.add_type(field.type.name, "OBJECT")
+        try:
+            field, args = await task
+            for arg in args:
+                schema.add_type(arg.type.name, "INPUT_OBJECT")
+            schema.types[typename].fields.append(field)
+            schema.add_type(field.type.name, "OBJECT")
+        except Exception as e:
+            log().warning(f"Error processing field: {str(e)}")
 
     return repr(schema)
